@@ -2,100 +2,142 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net/http"
+	"net/http/httputil"
 	"net/url"
+	"sync"
+	"time"
 )
 
-
-var servers = []string{
-	"http://localhost:8081",
-	"http://localhost:8082",
-	"http://localhost:8083",
+// Backend represents a backend server
+type Backend struct {
+	URL          *url.URL
+	Alive        bool
+	mux          sync.RWMutex
+	ReverseProxy *httputil.ReverseProxy
 }
 
-var currentServer = 0
-
-
-// round robin algorithm picks the next backend in a circular way
-func roundRobin() string {
-	server := servers[currentServer]
-	currentServer = (currentServer + 1) % len(servers)
-	return server
+// Check if backend is alive
+func (b *Backend) IsAlive() bool {
+	b.mux.RLock()
+	defer b.mux.RUnlock()
+	return b.Alive
 }
 
+// Set backend status
+func (b *Backend) SetAlive(alive bool) {
+	b.mux.Lock()
+	b.Alive = alive
+	b.mux.Unlock()
+}
 
-//handler forwards the request to a backend server
-func handler(w http.ResponseWriter, r *http.Request) {
-	server := roundRobin()
+// LoadBalancer struct
+type LoadBalancer struct {
+	backends []*Backend
+	current  uint64
+	mux      sync.Mutex
+}
 
-	//Parse the server URL
-	url, err := url.Parse(server)
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+// NewLoadBalancer creates a load balancer with given backend URLs
+func NewLoadBalancer(urls []string) *LoadBalancer {
+	backends := make([]*Backend, 0)
+	for _, u := range urls {
+		parsedURL, err := url.Parse(u)
+		if err != nil {
+			log.Fatalf("Invalid backend URL: %s", u)
+		}
+		proxy := httputil.NewSingleHostReverseProxy(parsedURL)
+		backends = append(backends, &Backend{
+			URL:          parsedURL,
+			Alive:        true,
+			ReverseProxy: proxy,
+		})
 	}
+	return &LoadBalancer{backends: backends}
+}
 
-	//Create a reverse proxy
-	req, err := http.NewRequest(r.Method, url.String() + r.RequestURI, r.Body)
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	//Copy the headers from the original request
-	req.Header = r.Header
-
-	//Send the request to the backend server
-	client := &http.Client{}
-	resp, err := client.Do(req)
-
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	//Copy the response headers from the backend server to the client
-	for name, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(name, value)
+// Get next alive backend using round-robin
+func (lb *LoadBalancer) NextBackend() *Backend {
+	lb.mux.Lock()
+	defer lb.mux.Unlock()
+	total := len(lb.backends)
+	for i := 0; i < total; i++ {
+		b := lb.backends[lb.current%uint64(total)]
+		lb.current++
+		if b.IsAlive() {
+			return b
 		}
 	}
-
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	return nil
 }
 
-//Go routines to start all the servers
-func startServer(port string, message string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, message)
-	})
+// Health check each backend every interval
+func (lb *LoadBalancer) HealthCheck(interval time.Duration) {
+	for {
+		for _, b := range lb.backends {
+			go func(backend *Backend) {
+				resp, err := http.Get(backend.URL.String())
+				if err != nil || resp.StatusCode >= 400 {
+					backend.SetAlive(false)
+					log.Printf("Backend %s is DOWN\n", backend.URL)
+				} else {
+					backend.SetAlive(true)
+					log.Printf("Backend %s is UP\n", backend.URL)
+				}
+			}(b)
+		}
+		time.Sleep(interval)
+	}
+}
 
-	server := &http.Server{
-		Addr: port,
-		Handler: mux,
+// ServeHTTP implements the reverse proxy handler
+func (lb *LoadBalancer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	backend := lb.NextBackend()
+	if backend == nil {
+		http.Error(w, "No backend available", http.StatusServiceUnavailable)
+		return
 	}
 
-	log.Printf("Server %s started on port %s", message, port)
+	log.Printf("Forwarding request %s %s to %s\n", r.Method, r.URL.Path, backend.URL)
+	backend.ReverseProxy.ServeHTTP(w, r)
+}
+
+// Start backend server (for testing)
+func startServer(port, message string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, message)
+	})
+	server := &http.Server{
+		Addr:    port,
+		Handler: mux,
+	}
+	log.Printf("%s running on %s\n", message, port)
 	log.Fatal(server.ListenAndServe())
 }
 
 func main() {
-    // Start backend servers
-    go startServer(":8081", "Response from Server 1")
-    go startServer(":8082", "Response from Server 2")
-    go startServer(":8083", "Response from Server 3")
+	// Start backend servers in goroutines
+	go startServer(":8081", "Response from Server 1")
+	go startServer(":8082", "Response from Server 2")
+	go startServer(":8083", "Response from Server 3")
 
-    // Start load balancer
-    fmt.Println("Starting load balancer... at port 8080")
-    http.HandleFunc("/", handler)
-    log.Fatal(http.ListenAndServe(":8080", nil))
+	// Give backends time to start
+	time.Sleep(time.Second)
 
-    select {} 
+	// Load balancer setup
+	backendURLs := []string{
+		"http://localhost:8081",
+		"http://localhost:8082",
+		"http://localhost:8083",
+	}
+	lb := NewLoadBalancer(backendURLs)
+
+	// Start health check
+	go lb.HealthCheck(5 * time.Second)
+
+	// Start load balancer server
+	log.Println("Load balancer running on :8080")
+	log.Fatal(http.ListenAndServe(":8080", lb))
 }
