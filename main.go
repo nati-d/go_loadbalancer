@@ -70,8 +70,32 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
+//Go routines to start all the servers
+func startServer(port string, message string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, message)
+	})
+
+	server := &http.Server{
+		Addr: port,
+		Handler: mux,
+	}
+
+	log.Printf("Server %s started on port %s", message, port)
+	log.Fatal(server.ListenAndServe())
+}
+
 func main() {
-	fmt.Println("Starting load balancer... at port 8080")
-	http.HandleFunc("/", handler)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+    // Start backend servers
+    go startServer(":8081", "Response from Server 1")
+    go startServer(":8082", "Response from Server 2")
+    go startServer(":8083", "Response from Server 3")
+
+    // Start load balancer
+    fmt.Println("Starting load balancer... at port 8080")
+    http.HandleFunc("/", handler)
+    log.Fatal(http.ListenAndServe(":8080", nil))
+
+    select {} 
 }
